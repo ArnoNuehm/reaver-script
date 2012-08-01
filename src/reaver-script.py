@@ -204,8 +204,8 @@ class ReaverScript(object):
     def run(self):
         try:
             self.start_time = time.time()
-            buffer = file(r'wash_test.txt','rb').read() 
-            #buffer = self.wash()
+            #buffer = file(r'wash_test.txt','rb').read() 
+            buffer = self.wash()
             
             self.groups = self.parse_wash(buffer)
             
