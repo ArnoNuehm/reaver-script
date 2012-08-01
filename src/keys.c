@@ -36,7 +36,7 @@
 /* Arrays of possible pin combinations. Pins with a priority field of 1 get tried first. */
 
 struct key k1[P1_SIZE] = {
-		{ "0000", 1 },
+		{ "1234", 1 },
 		{ "0000", 1 },
 		{ "0001", 0 },
 		{ "0002", 0 },
