@@ -4,16 +4,16 @@ INC=-I$(LIBWPS_DIR)
 prefix=@prefix@
 exec_prefix=@exec_prefix@
 CONFDIR=@sysconfdir@/@target@
-CFLAGS=-DCONF_DIR='"$(CONFDIR)"' -DREAVER_DATABASE='"$(CONFDIR)/reaver.db"' @CFLAGS@
+CFLAGS=-DCONF_DIR='"$(CONFDIR)"' -DREAVER_DATABASE='"$(CONFDIR)/reaver_tag.db"' @CFLAGS@
 LDFLAGS=$(LIBWPS_DIR)/*.o wps/*.o tls/bignum.o tls/libtls.a utils/libutils.a crypto/libcrypto.a lwe/libiw.a @LDFLAGS@
 
-all: wash reaver
+all: wash reaver_tag
 
 wash: wps libiw libwps.o argsparser.o globule.o init.o misc.o 80211.o iface.o
 	$(CC) $(CFLAGS) $(INC) wpsmon.c *.o $(LDFLAGS) -o wash
 
-reaver: wps libiw libwps.o argsparser.o globule.o init.o sigint.o sigalrm.o misc.o cracker.o
-	$(CC) $(CFLAGS) $(INC) wpscrack.c *.o $(LDFLAGS) -o reaver
+reaver_tag: wps libiw libwps.o argsparser.o globule.o init.o sigint.o sigalrm.o misc.o cracker.o
+	$(CC) $(CFLAGS) $(INC) wpscrack.c *.o $(LDFLAGS) -o reaver_tag
 
 libwps.o:
 	(cd $(LIBWPS_DIR) && make)
@@ -86,12 +86,12 @@ globule.o:
 
 install: cleanbin
 	if [ ! -d $(CONFDIR) ]; then mkdir -p $(CONFDIR); fi
-	if [ ! -e $(CONFDIR)/reaver.db ]; then cp reaver.db $(CONFDIR)/reaver.db && chmod -R a+rw $(CONFDIR); fi
+	if [ ! -e $(CONFDIR)/reaver_tag.db ]; then cp reaver_tag.db $(CONFDIR)/reaver_tag.db && chmod -R a+rw $(CONFDIR); fi
 	if [ -e wash ]; then cp wash @bindir@/wash; fi
-	if [ -e reaver ]; then cp reaver @bindir@/reaver; fi
+	if [ -e reaver_tag ]; then cp reaver_tag @bindir@/reaver_tag; fi
 
 clean:
-	rm -f *~ *.o reaver wash
+	rm -f *~ *.o reaver_tag wash
 	rm -rf *.cache config.status config.log
 	(cd utils && make clean)
 	(cd tls && make clean)
@@ -102,7 +102,7 @@ clean:
 	rm -f Makefile config.h
 
 cleanbin: 
-	rm -f @bindir@/reaver @bindir@/wash @bindir@/walsh
+	rm -f @bindir@/reaver_tag @bindir@/wash @bindir@/walsh
 
 distclean: cleanbin clean
 	rm -rf $(CONFDIR)
