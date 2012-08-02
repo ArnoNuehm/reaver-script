@@ -11,6 +11,7 @@ from os import curdir, sep
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 import threading
 from optparse import OptionParser
+import traceback
 
 VERSION = "0.1"
 VERSION_STR = 'Reaver Companion v%s\nCopyright 2012, Ruby Feinstein <shoote@gmail.com>' % VERSION
@@ -20,7 +21,7 @@ REAVER_CMD = "%s -i %%s -b %%s -c %%d -vv" % REAVER_TAG
 WASH_CMD   = "./wash -i %s"
 
 WASH_TIMEOUT = 30
-SIMULATE_WASH = True
+SIMULATE_WASH = False
 
 LOG_DIR = "reaver-script-logs"
 
@@ -58,6 +59,7 @@ TIMESTAMP_FORMAT = "%d.%m.%y %H:%M:%S"
 START_TIME_STR = time.strftime(TIMESTAMP_FORMAT)
 
 HTTP_SERVER_LOG = "http_server.log"
+HTTP_PORT = 80
 
 class DebugClass(object):
     def __init__(self, log_filename = "reaver-script.log"):
@@ -116,13 +118,14 @@ def generate_handler(parent):
         def _gen_networks_table(self):
             networks = parent.get_all_networks()
             result = ""
-            # chan, status, last iter duration, pin count, bssid, essid, kill
+            # chan, status, last iter duration, pin count, rssi, bssid, essid, kill
             template = """
     <tr>
         <td>%d</td>
         <td><a href="/log/%s">%s</a></td> 
         <td>%d</td> 
         <td>%d</td>    
+        <td>%0.2f</td>
         <td>%s</td>    
         <td>%s</td>        
         <td><a href="/kill/?/%s">x</a></td>   
@@ -134,6 +137,7 @@ def generate_handler(parent):
                                       n.status_str(),
                                       n.get_last_iter_duration(),
                                       n.pin_count,
+                                      n.rssi,
                                       n.bssid,
                                       n.essid,
                                       n.bssid)
@@ -169,6 +173,14 @@ def generate_handler(parent):
             self.wfile.write(f.read())
             f.close()        
         
+        def handle_get_main_log(self):
+            self.debug(VERBOSE, "serving main log")
+            self.send_response(200)
+            self.send_header('Content-type','text')
+            self.end_headers()
+            f = file(parent.get_log_file(),'r')
+            self.wfile.write(f.read())
+            f.close()         
         
         def handle_kill(self, bssid):
             n = self.find_network_for_bssid(bssid)
@@ -218,6 +230,10 @@ def generate_handler(parent):
                         self.handle_main()
                         return
                     
+                    if self.path == "/full_log/":
+                        self.handle_get_main_log()
+                        return
+                    
                     if self.path.find("/log/")!=-1:
                         bssid = self.path.split("/")[-1]
                         self.handle_get_log(bssid)
@@ -246,12 +262,14 @@ class TinyHttpServer(DebugClass, threading.Thread):
     
     def run(self):
         try:
-            self.server = HTTPServer(('', 80), generate_handler(self.parent) )
+            self.server = HTTPServer(('', HTTP_PORT), generate_handler(self.parent) )
             self.debug(INFO,'started httpserver...')
             self.server.serve_forever()
         except KeyboardInterrupt:
             self.parent.debug(ERROR, '^C received, shutting down server')
-            self.server.socket.close()
+        finally:
+            if self.server:
+                self.server.socket.close()
 
 class Watchdog(DebugClass, threading.Thread):
     def __init__(self, parent):
@@ -506,6 +524,13 @@ class Group(DebugClass):
             self.select_loop()
         return count
     
+    def get_running_max_last_iter(self):
+        m = 0
+        for n in self.networks:
+            if n.status in [RUNNING]:
+                m = max(m, n.last_iter_duration)
+        return m
+    
     def select_loop(self):
         self.last_iter_time = 0
         self.iter_count +=1
@@ -513,18 +538,26 @@ class Group(DebugClass):
 
         r_wait_list = []
         for n in self.networks:
+            reverse_dict[n.p.stdout] = n
+            reverse_dict[n.p.stderr] = n          
             if n.p!=None and n.p.poll()!=None:
                 n.status = DEAD
             if n.status == RUNNING:
                 r_wait_list.append(n.p.stdout)
-                r_wait_list.append(n.p.stderr)
-                reverse_dict[n.p.stdout] = n
-                reverse_dict[n.p.stderr] = n             
+                r_wait_list.append(n.p.stderr)           
         
         start_time = time.time()
         while len(r_wait_list):
             r_wait_list = []
             for n in self.networks:
+                if n.status==SUSPENDED and time.time() - n.suspend_time > n.min_sleep_time:
+                    duration = time.time() - start_time
+                    if n.last_iter_duration + duration < self.get_running_max_last_iter():
+                        # guess we can run one more time
+                        self.debug(VERBOSE, "giving %s one more timeslot" % n)
+                        n.p.send_signal(SIGCONT)
+                        n.set_status_running()
+                    
                 if n.status==RUNNING and n.p.poll()!=None:
                     n.status = DEAD
                     n.last_iter_duration = time.time() - start_time
@@ -550,7 +583,6 @@ class Group(DebugClass):
                         n.suspend_time = time.time()
                         n.total_run_time += n.last_iter_duration
                         n.min_sleep_time = int(line.split(" ")[-1])
-                        
                     if line.find("Trying pin")!=-1:
                         new_pin = line.split(" ")[-1]
                         if new_pin != n.current_pin:
@@ -659,9 +691,9 @@ def my_popen(command):
     return p
 
 def main():
-
     global PRINT_LEVEL
     global MAX_TIME_PER_ITER
+    global HTTP_PORT
     
     parser = OptionParser(usage=VERSION_STR)
     parser.add_option("-i", "--interface", dest="interface",
@@ -670,15 +702,23 @@ def main():
                       help="sets the verbosity level printed to stdout", default=PRINT_LEVEL, action="store")
     parser.add_option("-t", "--iter_timeout", dest="iter_timeout",
                       help="sets the max iteration time (per reaver instance)", default=MAX_TIME_PER_ITER, action="store")
-                          
+    parser.add_option("-p", "--port", dest="port",
+                      help="http server port", default=HTTP_PORT, action="store")    
+    
     (options, args) = parser.parse_args()
     
 
     PRINT_LEVEL = int(options.verbose)
     MAX_TIME_PER_ITER = int(options.iter_timeout)
+    HTTP_PORT = int(options.port)
     interface = options.interface
     r = ReaverScript(interface = interface)
-    r.run()
+    try:
+        r.run()
+    except Exception,e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        r.debug(ERROR,"exception occured:\n%s" % traceback.format_exc())
+        raise e
     
 if __name__ == '__main__':
     main()
