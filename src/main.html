@@ -1,8 +1,16 @@
 <html>
 <head>
 <title>reaver-script - main</title>
+<script type="text/javascript">
+<!--
+function delayer(){
+    window.location = "/"
+}
+//-->
+</script>
 </head>
-<body>
+<body onLoad="setTimeout('delayer()', 3000)">
+[version_str]
 <table border="1">
 <tr><td>start time</td><td>[start_time]</td></tr>
 <tr><td>total pins tried</td><td>[total_number_of_pins]</td></tr>

