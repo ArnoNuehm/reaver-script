@@ -383,6 +383,7 @@ class ReaverScript(DebugClass):
                 buffer = wash.run()
             
             self.groups = self.parse_wash(buffer)
+            self.scheduler = Scheduler(self.groups, self)
             
             self.watchdog = Watchdog(self)
             self.watchdog.start()            
@@ -399,11 +400,20 @@ class ReaverScript(DebugClass):
                     self.debug(INFO, "STATS: tested %d pins, %0.1f sec/pin" % 
                          (self.total_number_of_pins, self.get_seconds_per_pin() ) )                
                 
-                for g in self.groups:
-                    if g.count()==0:
-                        continue
-                    count += g.run_loop()
+                # TODO: fix the const
+                for i in xrange(10):
+                    self.debug(INFO, "self.scheduler.get_next_group()")
+                    g = self.scheduler.get_next_group()
+                    run_count = g.run_loop()
+                    if run_count == 0:
+                        self.debug(INFO, "added penalty sleep to channel %d" % g.channel)
+                        min_sleep = g.get_min_sleep()
+                        g.total_run_time += min_sleep
+                    count += run_count
                     self.debug(VERBOSE, repr(g))  
+                
+                self.scheduler.update_priority()
+                
                 if count == 0:
                     timeout = self.get_smart_suspend_time()
                     self.debug(INFO, "all the networks are suspended, sleeping for %d seconds" % timeout)
@@ -481,7 +491,55 @@ class WashWrapper(DebugClass):
         #todo check return codeash 
         self.parent.debug(INFO,"Wash ended nicely")
         return data           
+
+class Scheduler(DebugClass):
+    def __init__(self, groups, parent):
+        self.parent = parent
+        self.groups = groups
+        DebugClass.__init__(self)
+    
+    def update_priority(self):
+        speeds = []
+        for g in self.groups:
+            speed = -1
+            if g.total_run_time !=0:
+                speed = float(g.number_of_pins) / g.total_run_time
+            speeds.append(g)
+            g.speed = speed
+        speeds.sort()
+        for i in xrange(len(speeds)):
+            for g in self.groups:
+                if g.speed == speeds[i]:
+                    g.priority = i+1
+                    g.speed = None
+                    break
+
+    def get_priority_sum(self):
+        priority_sum = 0
+        for g in self.groups:
+            if g.count_living_networks()==0:
+                g.priority = 0
+            else:
+                priority_sum += g.priority
+        return priority_sum
         
+    def get_next_group(self):
+        total_time = 0
+        for g in self.groups:
+            total_time += g.total_run_time
+        timeslot = total_time / self.get_priority_sum()
+        self.debug(VERBOSE, "self.get_priority_sum() = %d" % self.get_priority_sum())
+        self.debug(VERBOSE, "timeslot: %0.2f" % timeslot)
+        max_diff = -1000
+        max_group = None
+        for g in self.groups:
+            if g.priority != 0:
+                g.diff = timeslot * g.priority - g.total_run_time
+                if max_diff < g.diff:
+                    max_diff = g.diff
+                    max_group = g
+        return max_group
+       
 class Group(DebugClass):
     def __init__(self, channel, parent, networks=None):
         self.parent = parent
@@ -493,8 +551,23 @@ class Group(DebugClass):
         self.iter_count = 0
         self.avg_iter_time = 0
         self.total_run_time = 0
+        self.number_of_pins = 0
+        self.priority = 1
         DebugClass.__init__(self)
         
+    def count_living_networks(self):
+        count = 0
+        for n in self.networks:
+            if n.status in [RUNNING, SUSPENDED, PRE_RUN]:
+                count += 1
+        return count
+    
+    def get_min_sleep(self):
+        m = 0
+        for n in self.networks:
+            m = min(n.min_sleep_time, m)
+        return max(m,2)
+    
     def add(self,n):
         self.networks.append(n)
     
@@ -518,6 +591,7 @@ class Group(DebugClass):
         return buffer
     
     def run_loop(self):
+        self.debug(VERBOSE, "run_loop for channel %s" % self.channel)
         self.parent.switch_channel(self.channel)
         count = self.run()
         if count >= 0:
@@ -560,7 +634,7 @@ class Group(DebugClass):
                     
                 if n.status==RUNNING and n.p.poll()!=None:
                     n.status = DEAD
-                    n.last_iter_duration = time.time() - start_time
+                    n.last_iter_duration = time.time() - n.start_time
                     
                 if n.status == RUNNING:
                     r_wait_list.append(n.p.stdout)
@@ -579,7 +653,7 @@ class Group(DebugClass):
                         r_wait_list.remove(n.p.stdout)
                         r_wait_list.remove(n.p.stderr)
                         n.status = SUSPENDED
-                        n.last_iter_duration = time.time() - start_time
+                        n.last_iter_duration = time.time() - n.start_time
                         n.suspend_time = time.time()
                         n.total_run_time += n.last_iter_duration
                         n.min_sleep_time = int(line.split(" ")[-1])
@@ -589,6 +663,7 @@ class Group(DebugClass):
                             n.current_pin = new_pin
                             n.pin_count += 1
                             self.parent.total_number_of_pins += 1
+                            self.number_of_pins += 1
                     if line.find("Restore previous session for")!=-1:
                         self.debug(INFO,"auto restore previous session for %s" % n)
                         n.p.stdin.write("Y\n")
