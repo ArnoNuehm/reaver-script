@@ -20,8 +20,8 @@ REAVER_TAG = "./reaver_tag"
 REAVER_CMD = "%s -i %%s -b %%s -c %%d -vv" % REAVER_TAG
 WASH_CMD   = "./wash -i %s -C"
 
-WASH_TIMEOUT = 30
-SIMULATE_WASH = True
+WASH_TIMEOUT = 45
+SIMULATE_WASH = False
 
 LOG_DIR = "reaver-script-logs"
 
