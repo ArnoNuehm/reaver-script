@@ -18,10 +18,10 @@ VERSION_STR = 'Reaver Companion v%s\nCopyright 2012, Ruby Feinstein <shoote@gmai
 
 REAVER_TAG = "./reaver_tag"
 REAVER_CMD = "%s -i %%s -b %%s -c %%d -vv" % REAVER_TAG
-WASH_CMD   = "./wash -i %s"
+WASH_CMD   = "./wash -i %s -C"
 
 WASH_TIMEOUT = 30
-SIMULATE_WASH = False
+SIMULATE_WASH = True
 
 LOG_DIR = "reaver-script-logs"
 
@@ -143,7 +143,32 @@ def generate_handler(parent):
                                       n.bssid)
                 
             return result
-            
+        
+        def _gen_groups_table(self):
+            groups = parent.groups
+            result = ""
+            # chan, priority, target run time, real run time, speed
+            template = """
+    <tr>
+        <td>%d</td>
+        <td>%d</td> 
+        <td>%d</td> 
+        <td>%d</td>    
+        <td>%0.2f</td>
+    </tr>"""
+
+            for g in groups:
+                if len(g.networks) == 0:
+                    continue
+                result += template % (g.channel,
+                                      g.priority,
+                                      g.wanted,
+                                      g.total_run_time,
+                                      g.get_speed())
+                
+            return result		
+    
+        
         def get_version_html(self):
             buffer = ""
             for line in VERSION_STR.splitlines():
@@ -161,6 +186,7 @@ def generate_handler(parent):
             response = response.replace("[total_number_of_pins]", str(parent.total_number_of_pins) )
             response = response.replace("[seconds_per_pin]", "%0.1f" % parent.get_seconds_per_pin() ) 
             response = response.replace("[networks]", self._gen_networks_table() )
+            response = response.replace("[groups]", self._gen_groups_table() )
             self.wfile.write(response)
             return
             
@@ -256,9 +282,12 @@ class TinyHttpServer(DebugClass, threading.Thread):
         threading.Thread.__init__(self)
         DebugClass.__init__(self, log_filename=HTTP_SERVER_LOG)
         self.server = None
+    
     def shutdown(self):
         if self.server:
+            self.debug(INFO,'closing httpserver...')
             self.server.shutdown()
+            self.server.socket.close()
     
     def run(self):
         try:
@@ -305,9 +334,20 @@ class ReaverScript(DebugClass):
         self.server = None
         self.watchdog = None
         self.sanity()
-    
+        self.min_run_time = 0
+        
     def sanity(self):
-        self.check_mon_interface()   
+        if not os.geteuid() == 0:
+            message = "sanity: reaver-script must run as root"
+            self.debug(ERROR, message)                
+            raise Exception(message)
+        if self.check_mon_interface() == False:
+            self.debug(INFO, "trying to create mon0 interface using airmon-ng")
+            self.create_mon_interface()
+            if self.check_mon_interface() == False:
+                message = "sanity: failed creating mon0, try using airmon-ng manually"
+                self.debug(ERROR, message)                
+                raise Exception(message)
         wash = WashWrapper(self)
         wash.sanity()
         self.check_reaver_tag()
@@ -320,6 +360,15 @@ class ReaverScript(DebugClass):
             return "running wash"
         elif self.state == STATE_RUNNING_REAVER:
             return "running reaver"
+    
+    def create_mon_interface(self):
+        try:
+            subprocess.check_call("airmon-ng start wlan0", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  
+        except subprocess.CalledProcessError, e:
+            message = "create_mon_interface: failed creating mon0"
+            self.debug(INFO, message)
+            return False
+        return True
     
     def check_reaver_tag(self):
         try:
@@ -337,8 +386,9 @@ class ReaverScript(DebugClass):
             subprocess.check_call("iwconfig %s" % self.interface, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  
         except subprocess.CalledProcessError, e:
             message = "SANITY CHECK ERROR: you should first use airmon-ng to create %s interface" % self.interface
-            self.debug(ERROR, message)
-            raise e      
+            self.debug(INFO, message)
+            return False
+        return True
         
     def switch_channel(self, n):
         self.debug(VERBOSE, "switching to channel %d." % n)
@@ -390,18 +440,27 @@ class ReaverScript(DebugClass):
             
             self.state = STATE_RUNNING_REAVER
             
+            iter_num = 0
+            active_channels = 0
             for i in self.groups:
+                if len(i.networks) > 0:
+                    active_channels += 1
                 self.debug(VERBOSE, repr(i))
             while self.count_living_networks() != 0:
+                iter_num += 1
                 count = 0
                 total_time = time.time() - self.start_time
 
+                if iter_num == 3:
+                    # Todo: fix const
+                    self.debug(VERBOSE, "setting min_run_time")
+                    self.min_run_time = 90
+                
                 if self.total_number_of_pins !=0:
                     self.debug(INFO, "STATS: tested %d pins, %0.1f sec/pin" % 
                          (self.total_number_of_pins, self.get_seconds_per_pin() ) )                
                 
-                # TODO: fix the const
-                for i in xrange(10):
+                for i in xrange(active_channels):
                     self.debug(INFO, "self.scheduler.get_next_group()")
                     g = self.scheduler.get_next_group()
                     run_count = g.run_loop()
@@ -418,12 +477,15 @@ class ReaverScript(DebugClass):
                     timeout = self.get_smart_suspend_time()
                     self.debug(INFO, "all the networks are suspended, sleeping for %d seconds" % timeout)
                     time.sleep(timeout)
-                    
+                
+                
+                
             self.debug(INFO, "we finished here (count_living_networks == 0)")
             
         except KeyboardInterrupt:
             self.debug(ERROR, '^C received, shutting down.')
         finally:
+            print "finally..."
             if self.server:
                 self.server.shutdown()
             if self.watchdog:
@@ -499,18 +561,26 @@ class Scheduler(DebugClass):
         DebugClass.__init__(self)
     
     def update_priority(self):
+        self.debug(VERBOSE, "update_priority: started")
         speeds = []
         for g in self.groups:
-            speed = -1
+            speed = 0
             if g.total_run_time !=0:
                 speed = float(g.number_of_pins) / g.total_run_time
-            speeds.append(g)
+            speeds.append(speed)
             g.speed = speed
         speeds.sort()
+        self.debug(VERBOSE, "update_priority: speeds - %s" % repr(speeds))
+        
+        counter = 0
         for i in xrange(len(speeds)):
             for g in self.groups:
-                if g.speed == speeds[i]:
-                    g.priority = i+1
+                if g.count_living_networks() == 0:
+                    g.priority = 0
+                elif g.speed == speeds[i]:
+                    counter += 1
+                    g.priority = counter
+                    self.debug(VERBOSE, "update_priority: set channel %d priority to %d" % (g.channel, g.priority))
                     g.speed = None
                     break
 
@@ -519,6 +589,7 @@ class Scheduler(DebugClass):
         for g in self.groups:
             if g.count_living_networks()==0:
                 g.priority = 0
+                self.debug(VERBOSE, "zero channel %d priority" % g.channel)
             else:
                 priority_sum += g.priority
         return priority_sum
@@ -527,14 +598,18 @@ class Scheduler(DebugClass):
         total_time = 0
         for g in self.groups:
             total_time += g.total_run_time
-        timeslot = total_time / self.get_priority_sum()
-        self.debug(VERBOSE, "self.get_priority_sum() = %d" % self.get_priority_sum())
+        priority_sum = self.get_priority_sum()
+        if priority_sum == 0:
+            raise Exception("No more networks to crack")
+        timeslot = total_time / priority_sum
+        self.debug(VERBOSE, "self.get_priority_sum() = %d" % priority_sum)
         self.debug(VERBOSE, "timeslot: %0.2f" % timeslot)
         max_diff = -1000
         max_group = None
         for g in self.groups:
             if g.priority != 0:
-                g.diff = timeslot * g.priority - g.total_run_time
+                g.wanted = timeslot * g.priority
+                g.diff = g.wanted - g.total_run_time
                 if max_diff < g.diff:
                     max_diff = g.diff
                     max_group = g
@@ -553,8 +628,15 @@ class Group(DebugClass):
         self.total_run_time = 0
         self.number_of_pins = 0
         self.priority = 1
+        self.wanted = 0
         DebugClass.__init__(self)
-        
+    
+    def get_speed(self):
+        if self.total_run_time != 0:
+            return float(self.number_of_pins) / self.total_run_time
+        else:
+            return 0
+    
     def count_living_networks(self):
         count = 0
         for n in self.networks:
@@ -626,7 +708,7 @@ class Group(DebugClass):
             for n in self.networks:
                 if n.status==SUSPENDED and time.time() - n.suspend_time > n.min_sleep_time:
                     duration = time.time() - start_time
-                    if n.last_iter_duration + duration < self.get_running_max_last_iter():
+                    if n.last_iter_duration + duration < max(self.get_running_max_last_iter(), self.parent.min_run_time):
                         # guess we can run one more time
                         self.debug(VERBOSE, "giving %s one more timeslot" % n)
                         n.p.send_signal(SIGCONT)
@@ -689,12 +771,15 @@ class Group(DebugClass):
                 n.p = my_popen(n.get_command())
                 n.set_status_running()
                 count += 1
-            elif n.p.poll()==None:
+            elif (n.status != CRACKED) and (n.p.poll()==None):
                 n.p.send_signal(SIGCONT)
                 n.set_status_running()
                 count += 1 
             elif n.status != CRACKED:
                 n.status = DEAD
+            else:
+                Exception("Invalid mode for network %s" % n)
+
         return count
 class Network(DebugClass):
     def __init__(self,line, parent):
