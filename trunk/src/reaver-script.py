@@ -553,17 +553,20 @@ class WashWrapper(DebugClass):
         start_time = time.time()
         p = my_popen(WASH_CMD % (self.parent.interface) )
         data = ""
-        while (time.time() - start_time < WASH_TIMEOUT) and p.poll()==None:
-            r_list, w_list, x_list = select([p.stdout, p.stderr], [], [], 0.5)
-            for i in r_list:
-                buffer = i.read()
-                if len(buffer)>0:
-                    self.debug(INFO, buffer, add_line = False)
-                data += buffer
-                self.parent.wash_data = data
-        if p.poll()!=None:
-            self.parent.debug(ERROR, "wash finished ahead of time")
-            raise Exception("wash finished ahead of time")
+        try:
+            while (time.time() - start_time < WASH_TIMEOUT) and p.poll()==None:
+                r_list, w_list, x_list = select([p.stdout, p.stderr], [], [], 0.5)
+                for i in r_list:
+                    buffer = i.read()
+                    if len(buffer)>0:
+                        self.debug(INFO, buffer, add_line = False)
+                    data += buffer
+                    self.parent.wash_data = data
+            if p.poll()!=None:
+                self.parent.debug(ERROR, "wash finished ahead of time")
+                raise Exception("wash finished ahead of time")
+        except KeyboardInterrupt:
+            self.parent.debug(ERROR, '^C received, stopping wash')
         p.terminate()
         #todo check return codeash 
         self.parent.debug(INFO,"Wash ended nicely")
@@ -768,6 +771,12 @@ class Group(DebugClass):
                     if line.find("Pin cracked in")!=-1:
                         self.debug(INFO, "cracked pin for %s" % n)
                         n.status = CRACKED
+                    if line.find("WPS PIN:")!=-1:
+                        n.pin = line.split("'")[-2]
+                        self.debug(INFO, "pin: %s" % n.pin)
+                    if line.find("WPA PSK:")!=-1:
+                        n.psk = line.split("'")[-2]    
+                        self.debug(INFO, "psk: %s" % n.psk)
                         
         self.last_iter_time = time.time() - start_time     
         self.total_run_time += self.last_iter_time
@@ -820,6 +829,8 @@ class Network(DebugClass):
         self.version = float(self.version)
         self.pin_count = 0
         self.p = None
+        self.pin = "N/A"
+        self.psk = "N/A"
         
         DebugClass.__init__(self)   
         self.log_filename = "%d - %s - %s" % (self.channel, self.bssid, self.essid)
@@ -846,7 +857,7 @@ class Network(DebugClass):
         elif self.status == PRE_RUN:
             return "pre_run"  
         elif self.status == CRACKED:
-            return "cracked"
+            return "cracked(pin: %s, psk: %s)" % (self.pin,self.psk)
     
     def __str__(self):
         return "%s(%d)" % (self.essid, self.channel)
