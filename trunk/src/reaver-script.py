@@ -10,8 +10,11 @@ import string,cgi,time
 from os import curdir, sep
 from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 import threading
-from optparse import OptionParser
+from optparse import OptionParser, OptionGroup
 import traceback
+
+import SocketServer 
+SocketServer.TCPServer.allow_reuse_address = True 
 
 VERSION = "0.1"
 VERSION_STR = 'Reaver Companion v%s\nCopyright 2012, Ruby Feinstein <shoote@gmail.com>' % VERSION
@@ -22,6 +25,8 @@ WASH_CMD   = "./wash -i %s -C"
 
 WASH_TIMEOUT = 45
 SIMULATE_WASH = False
+
+MIN_TIME_SLOT = 90
 
 LOG_DIR = "reaver-script-logs"
 
@@ -342,6 +347,10 @@ class ReaverScript(DebugClass):
             self.debug(ERROR, message)                
             raise Exception(message)
         if self.check_mon_interface() == False:
+            if self.interface != "mon0":
+                message = "sanity: failed opening interface %s" % self.interface
+                self.debug(ERROR, message)                
+                raise Exception(message)
             self.debug(INFO, "trying to create mon0 interface using airmon-ng")
             self.create_mon_interface()
             if self.check_mon_interface() == False:
@@ -452,9 +461,8 @@ class ReaverScript(DebugClass):
                 total_time = time.time() - self.start_time
 
                 if iter_num == 3:
-                    # Todo: fix const
                     self.debug(VERBOSE, "setting min_run_time")
-                    self.min_run_time = 90
+                    self.min_run_time = MIN_TIME_SLOT
                 
                 if self.total_number_of_pins !=0:
                     self.debug(INFO, "STATS: tested %d pins, %0.1f sec/pin" % 
@@ -471,7 +479,8 @@ class ReaverScript(DebugClass):
                     count += run_count
                     self.debug(VERBOSE, repr(g))  
                 
-                self.scheduler.update_priority()
+                if iter_num >= 3:
+                    self.scheduler.update_priority()
                 
                 if count == 0:
                     timeout = self.get_smart_suspend_time()
@@ -508,7 +517,13 @@ class ReaverScript(DebugClass):
                 first_line = i+2
                 break
 
-        networks = [Network(i, self) for i in lines[first_line:]]
+        networks = []
+        for i in lines[first_line:]:
+            try:
+                networks.append(Network(i, self))
+            except AttributeError,e:
+                self.debug(VERBOSE,"skipping bad line in wash output: " % repr(i))
+                continue
         groups = [Group(i, self) for i in xrange(CHAN_MIN,CHAN_MAX+1)]
         for n in networks:
             self.debug(VERBOSE,"adding %s to group %d" % (n, n.channel-1))
@@ -854,6 +869,8 @@ def main():
     global PRINT_LEVEL
     global MAX_TIME_PER_ITER
     global HTTP_PORT
+    global WASH_TIMEOUT
+    global MIN_TIME_SLOT
     
     parser = OptionParser(usage=VERSION_STR)
     parser.add_option("-i", "--interface", dest="interface",
@@ -865,11 +882,22 @@ def main():
     parser.add_option("-p", "--port", dest="port",
                       help="http server port", default=HTTP_PORT, action="store")    
     
-    (options, args) = parser.parse_args()
+    group = OptionGroup(parser, "Advanced Options")
     
+    
+    group.add_option("-w", "--wash-timeout", dest="wash_timeout",
+                      help="sets the wps scanning (wash) running timeout (default: %d)" % WASH_TIMEOUT, default=WASH_TIMEOUT, action="store")    
+    group.add_option("-s", "--min-time", dest="min_time_slot",
+                      help="sets the minimum time per channel (default: %d)" % MIN_TIME_SLOT, default=MIN_TIME_SLOT, action="store")     
+    
+    parser.add_option_group(group)
+    
+    (options, args) = parser.parse_args()
 
     PRINT_LEVEL = int(options.verbose)
     MAX_TIME_PER_ITER = int(options.iter_timeout)
+    WASH_TIMEOUT = int(options.wash_timeout)
+    MIN_TIME_SLOT = int(options.min_time_slot)
     HTTP_PORT = int(options.port)
     interface = options.interface
     r = ReaverScript(interface = interface)
