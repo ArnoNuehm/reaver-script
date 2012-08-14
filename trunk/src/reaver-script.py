@@ -21,7 +21,7 @@ VERSION_STR = 'Reaver Companion v%s\nCopyright 2012, Ruby Feinstein <shoote@gmai
 
 REAVER_TAG = "./reaver_tag"
 REAVER_CMD = "%s -i %%s -b %%s -c %%d -vv" % REAVER_TAG
-WASH_CMD   = "./wash -i %s -C"
+WASH_CMD   = "wash -i %s -C"
 
 WASH_TIMEOUT = 45
 SIMULATE_WASH = False
@@ -373,6 +373,7 @@ class ReaverScript(DebugClass):
     def create_mon_interface(self):
         try:
             subprocess.check_call("airmon-ng start wlan0", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  
+            self.debug(INFO, "create_mon_interface: OK")
         except subprocess.CalledProcessError, e:
             message = "create_mon_interface: failed creating mon0"
             self.debug(INFO, message)
@@ -714,9 +715,9 @@ class Group(DebugClass):
         for n in self.networks:
             reverse_dict[n.p.stdout] = n
             reverse_dict[n.p.stderr] = n          
-            if n.p!=None and n.p.poll()!=None:
+            if (n.p!=None) and (n.p.poll()!=None) and (n.status!=CRACKED):
                 n.status = DEAD
-            if n.status == RUNNING:
+            if (n.status in [RUNNING, CRACKED]) and (n.p.poll()==None):
                 r_wait_list.append(n.p.stdout)
                 r_wait_list.append(n.p.stderr)           
         
@@ -736,7 +737,7 @@ class Group(DebugClass):
                     n.status = DEAD
                     n.last_iter_duration = time.time() - n.start_time
                     
-                if n.status == RUNNING:
+                if (n.status in [RUNNING, CRACKED]) and (n.p.poll()==None):
                     r_wait_list.append(n.p.stdout)
                     r_wait_list.append(n.p.stderr)        
             r_ready, w_ready, x_ready = select(r_wait_list, [], [], 0.5)
